@@ -4,6 +4,8 @@ import json
 import time
 import os
 import sys
+import datetime as dt
+from zoneinfo import ZoneInfo
 
 import requests
 import gzip
@@ -19,11 +21,18 @@ from pyproj import CRS
 from pyproj import Transformer
 
 import kafka_confluent as kc
+import psycopg as pg
 
 import logging
 logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 load_dotenv()
+
+nashville_tz = ZoneInfo('US/Central')
+
+
+def now_dtz():
+    return dt.datetime.now(tz=nashville_tz)
 
 
 # Helper function to wrap thread targets for fatal error handling
@@ -38,69 +47,229 @@ def thread_wrapper(target_func, args=(), name=""):
     return wrapped
 
 
+def _connect_weather_database() -> pg.Connection:
+    host = os.environ['SQL_HOSTNAME']
+    port = os.environ['SQL_PORT']
+    user = os.environ['SQL_USERNAME']
+    password = os.environ['SQL_PASSWORD']
+    database = 'NDOT'
+    retry_counter = 5
+    while retry_counter > 0:
+        try:
+            db_conn = pg.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                dbname=database,
+                autocommit=True)
+            return db_conn
+        except pg.OperationalError as e:
+            connection_error_context = e
+            logger.warning("Could not connect database for weather writing. Trying again....")
+            retry_counter -= 1
+            time.sleep(2)
+    else:
+        logger.error(f"Weather destination database parameters used were: "
+                      f"host={host}, port={port}, dbname={database}, user={user}")
+        raise pg.OperationalError(f"Could not connect database after all attempts.")
+
+
+def _check_weather_database_connections(db_conn: pg.Connection) -> bool:
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT 1=1;")
+            cur.fetchall()
+            return True
+    except Exception:
+        logger.warning("Weather database connection check failed. Attempting reconnect.")
+        return False
+
+
+
 class WeatherForecastProducer:
     def __init__(self, url, poll_interval_minutes, kafka_config):
         self.url = url
         self.poll_interval_seconds = poll_interval_minutes * 60
         self.kc = kc.KafkaConfluentHelper(kafka_config)
 
-        self.topic_name = ""
-        self.partition_key = ""
+        self.topic_name = "weather_forecast"
+        self.partition_key = "0"
+        # Persistent DB connection for inserts
+        self.db_conn = _connect_weather_database()
+    def insert_weather_batch(self, current_dict: dict, forecast_dicts: list[dict], write_time: dt.datetime):
+        """
+        Insert the current observation and forecast periods into laddms.weather using a single write_time.
+        Ensures the class has a valid persistent DB connection before inserting.
+        """
+        # Ensure DB connection is valid; reconnect if needed
+        if not _check_weather_database_connections(self.db_conn):
+            try:
+                self.db_conn.close()
+            except Exception:
+                pass
+            self.db_conn = _connect_weather_database()
+
+        insert_sql = """
+            INSERT INTO laddms.weather_conditions (
+                write_time,
+                start_time,
+                end_time,
+                generate_time,
+                is_daytime,
+                temperature,
+                feels_like,
+                humidity,
+                short_forecast,
+                precip_chance,
+                precip_last3hours
+            )
+            VALUES (
+                %(write_time)s, %(start_time)s, %(end_time)s, %(generate_time)s, %(is_daytime)s, 
+                %(temperature)s, %(feels_like)s, %(humidity)s, %(short_forecast)s, 
+                %(precip_chance)s, %(precip_last3hours)s
+            );
+        """
+
+        # Use executemany for efficiency
+        with self.db_conn.cursor() as cur:
+            cur.executemany(insert_sql, [{'write_time': write_time, **d} for d in [current_dict] + forecast_dicts])
+        logger.info(f"Inserted {len(forecast_dicts) + 1} rows into laddms.weather.")
 
 
     def wait(self):
         time.sleep(self.poll_interval_seconds)
 
-    def pull_weather_forecast(self):
+    def pull_weather_forecast(self, latitude, longitude, num_forecast_hours):
         # Step 1: Get metadata from /points
-        point_resp = requests.get(f"{BASE_URL}/points/{LAT},{LON}").json()
+        point_resp = requests.get(f"{self.url}/points/{latitude},{longitude}").json()
         stations_url = point_resp['properties']['observationStations']
         forecast_hourly_url = point_resp['properties']['forecastHourly']
 
         # Step 2: Get observation station and latest observation
         stations = requests.get(stations_url).json()
         station_id = stations['observationStations'][0].split('/')[-1]
-        obs = requests.get(f"{BASE_URL}/stations/{station_id}/observations/latest").json()['properties']
+        obs = requests.get(f"{self.url}/stations/{station_id}/observations/latest").json()['properties']
 
         # Extract current weather data
-        temperature = obs['temperature']['value']
+        if obs.get('temperature', {}).get('unitCode', '').upper() == 'WMOUNIT:DEGC':
+            # convert to degF
+            temperature = (float(obs['temperature']['value'])  * 9 / 5) + 32
+        else:
+            temperature = None
         humidity = obs['relativeHumidity']['value']
-        precip_last_hour = obs.get('precipitationLastHour', {}).get('value')
-        feels_like = obs.get('heatIndex', {}).get('value') or obs.get('windChill', {}).get('value')
-
-        # Step 3: Get next 6-hour forecast
-        forecast = requests.get(forecast_hourly_url).json()
-        next6 = forecast['properties']['periods'][:6]
+        # If can't find the value, use None
+        if obs.get('precipitationLast3Hours', {}).get('value', -1) == -1:
+            precip_last = None
+        # If value is present but None, assume 0.
+        elif obs.get('precipitationLast3Hours', {}).get('value') is None:
+            precip_last = 0
+        elif obs.get('precipitationLast3Hours', {}).get('value', '').upper() == 'NONE':
+            precip_last = 0
+        elif len(obs.get('precipitationLast3Hours', {}).get('value', '')) > 0:
+            if obs.get('precipitationLast3Hours', {}).get('unitCode', '').upper() == 'WMOUNIT:MM':
+                # convert to inches
+                precip_last = float(obs.get('precipitationLast3Hours', {}).get('value')) / 25.4
+            else:
+                precip_last = None
+        else:
+            precip_last = None
+        if obs.get('heatIndex', {}).get('value', None) is not None:
+            if obs.get('heatIndex', {}).get('unitCode', '').upper() == 'WMOUNIT:DEGC':
+                # convert to degF
+                feels_like = (float(obs.get('heatIndex').get('value')) * 9 / 5) + 32
+            else:
+                feels_like = None
+        elif obs.get('windChill', {}).get('value', None) is not None:
+            if obs.get('windChill', {}).get('unitCode', '').upper() == 'WMOUNIT:DEGC':
+                # convert to degF
+                feels_like = (float(obs.get('windChill', {}).get('value')) * 9 / 5) + 32
+            else:
+                feels_like = None
+        else:
+            feels_like = None
 
         # Output Current Conditions
-        print(f"\nCurrent Conditions in Nashville, TN:")
-        print(f"Temperature: {temperature} °C")
-        print(f"Feels Like: {feels_like} °C")
-        print(f"Humidity: {humidity}%")
-        print(f"Precipitation (last hour): {precip_last_hour} mm")
+        current_dict = {
+            'start_time': obs['timestamp'],
+            'end_time': None,
+            'generate_time': obs['timestamp'],
+            'is_daytime': None,
+            'temperature': temperature,
+            'feels_like': feels_like,
+            'humidity': humidity,
+            'short_forecast': obs.get('textDescription', None),
+            'precip_chance': None,
+            'precip_last3hours': precip_last,
+        }
 
-        # Output Forecast
-        print("\nForecast for the Next 6 Hours:")
-        for period in next6:
-            start_time = period['startTime']
-            temp = period['temperature']
-            short_forecast = period['shortForecast']
-            precip_chance = period['probabilityOfPrecipitation']['value']
-            print(f"{start_time}: {temp}°C, {short_forecast}, Precip: {precip_chance}%")
+        # Current UTC time (aware, not naive)
+        utc_now = datetime.now(tz=ZoneInfo("UTC"))
+        central_now = utc_now.astimezone(ZoneInfo("US/Central"))
 
-    def produce_forecast_to_kafka(self, forecast_dict):
-        for stop in self.stops_dict.values():
-            payload = {
-                "stop_id": stop.stop_id,
-                "name": stop.name,
-                "lat": stop.lat,
-                "lon": stop.lon,
-                "routes": list(stop.routes)
+        forecast = requests.get(forecast_hourly_url).json()
+        forecast_periods = forecast['properties']['periods']
+        # forecast_gen_time = dt.datetime.fromisoformat(forecast['properties']['generatedAt'])
+        print(forecast)
+
+        forecast_dicts = []
+        for period in forecast_periods:
+            start_time = dt.datetime.fromisoformat(period['startTime'])
+            if start_time < central_now:
+                continue
+            if period['temperatureUnit'].upper() == 'F':
+                temp = float(period['temperature'])
+            elif period['temperatureUnit'].upper() == 'C':
+                temp = (float(period['temperature']) * 9 / 5) + 32
+            else:
+                temp = None
+
+            try:
+                humidity = float(period['relativeHumidity']['value'])
+            except (ValueError, KeyError):
+                humidity = None
+            try:
+                precip_chance = float(period['probabilityOfPrecipitation']['value'])
+            except (ValueError, KeyError, TypeError):
+                precip_chance = None
+
+            forecast_dict = {
+                'start_time': period['startTime'],
+                'end_time': period['endTime'],
+                'generate_time': forecast['properties']['generatedAt'],
+                'is_daytime': period.get('isDaytime', None),
+                'temperature': temp,
+                'feels_like': None,
+                'humidity': humidity,
+                'short_forecast': period.get('shortForecast', None),
+                'precip_chance': precip_chance,
+                'precip_last3hours': None,
             }
+            forecast_dicts.append(forecast_dict)
+            if len(forecast_dicts) >= num_forecast_hours:
+                break
+
+        return current_dict, forecast_dicts
+
+    def produce_current_and_forecast_to_kafka(self, current_dict: dict, forecast_dicts: list[dict]):
+        # Produce to Kafka
+        self.kc.send(topic=self.topic_name, key=self.partition_key,
+                     json_data=json.dumps(current_dict),
+                     headers=[('service', b'weather'), ('datatype', b'current')])
+        for fd in forecast_dicts:
             self.kc.send(topic=self.topic_name, key=self.partition_key,
-                         json_data=json.dumps(payload),
-                         headers=[('service', b'gtfs'), ('datatype', b'stops')])
-        logger.info(f"Produced {len(self.stops_dict)} stops to kafka from GTFS static.")
+                         json_data=json.dumps(fd),
+                         headers=[('service', b'weather'), ('datatype', b'forecast')])
+        logger.info(f"Produced {len(forecast_dicts) + 1} weather data points to Kafka.")
+
+        # Now write to the database
+        # Use a single write_time for all rows in this batch
+        write_time = now_dtz()
+        try:
+            self.insert_weather_batch(current_dict=current_dict, forecast_dicts=forecast_dicts, write_time=write_time)
+        except Exception as e:
+            logger.error("Failed to insert weather data into the database.")
+            logger.exception(e, exc_info=True)
 
 
 class WeatherRadarProducer:
@@ -109,8 +278,8 @@ class WeatherRadarProducer:
         self.poll_interval_seconds = poll_interval_minutes * 60
         self.kc = kc.KafkaConfluentHelper(kafka_config)
 
-        self.topic_name = ""
-        self.partition_key = ""
+        self.topic_name = "weather_radar"
+        self.partition_key = "0"
 
 
     def wait(self):
@@ -131,7 +300,7 @@ class WeatherRadarProducer:
 
         # Get the latest file based on timestamp
         latest_file = sorted(files)[-1]
-        radar_url = base_url + latest_file
+        radar_url = self.url + latest_file
 
         print(f"Fetching latest Radar File: {radar_url}")
         response = requests.get(radar_url)
@@ -215,25 +384,29 @@ class WeatherRadarProducer:
         logger.info(f"Produced {len(self.stops_dict)} stops to kafka from GTFS static.")
 
 
-def update_weather_forecast(url, poll_interval, receiver_kafka_config):
+def update_weather_forecast(url, poll_interval, num_forecast_hours, locations: list[tuple], receiver_kafka_config):
     forecast_receiver = WeatherForecastProducer(url, poll_interval, kafka_config=receiver_kafka_config)
     logger.info("Created new instance of weather forecast receiver.")
     while True:
-        # 1) get the latest forecast
-        try:
-            rcv_data = forecast_receiver.pull_weather_forecast()
-        except Exception as e:
-            logger.error("Failed to pull updated weather forecast.")
-            logger.exception(e, exc_info=True)
-            forecast_receiver.wait()
-            continue
-        # 2) produce forecast to Kafka
-        try:
-            forecast_receiver.produce_forecast_to_kafka(forecast_dict=rcv_data)
-        except Exception as e:
-            logger.error("Failed to assemble and send weather forecast to Kafka.")
-            logger.exception(e, exc_info=True)
-        # 3) invoke WAIT on the receiver object
+        for location in locations:
+            lat, lon = location
+            # 1) get the latest forecast
+            try:
+                current_dict, forecast_dicts = forecast_receiver.pull_weather_forecast(latitude=lat, longitude=lon,
+                                                                                      num_forecast_hours=num_forecast_hours)
+            except Exception as e:
+                logger.error("Failed to pull updated weather forecast.")
+                logger.exception(e, exc_info=True)
+                forecast_receiver.wait()
+                continue
+            # 2) produce forecast to Kafka
+            try:
+                forecast_receiver.produce_current_and_forecast_to_kafka(current_dict=current_dict,
+                                                                        forecast_dicts=forecast_dicts)
+            except Exception as e:
+                logger.error("Failed to assemble and send weather forecast to Kafka.")
+                logger.exception(e, exc_info=True)
+            # 3) invoke WAIT on the receiver object
         forecast_receiver.wait()
 
 
@@ -291,13 +464,16 @@ if __name__ == "__main__":
 
     logger.info("Starting 2x weather to Kafka producer threads.")
     if True:
+        locations = [
+            (float(os.environ.get('WEATHER_FORECAST_LAT')), float(os.environ.get('WEATHER_FORECAST_LON')))
+        ]
         threading.Thread(target=thread_wrapper(update_weather_forecast, args=(
             os.environ.get('WEATHER_FORECAST_URL'),
             int(os.environ.get('WEATHER_FORECAST_UPDATE_SECS')),
-            float(os.environ.get('WEATHER_FORECAST_LAT')),
-            float(os.environ.get('WEATHER_FORECAST_LON')),
+            int(os.environ.get('WEATHER_NUM_FORECAST_HOURS')),
+            locations,
             common_kafka_config), name="weather_forecast")).start()
-    if True:
+    if False:
         threading.Thread(target=thread_wrapper(update_weather_radar, args=(
             os.environ.get('WEATHER_RADAR_URL'),
             int(os.environ.get('WEATHER_RADAR_UPDATE_SECS')),
