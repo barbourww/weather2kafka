@@ -1,4 +1,4 @@
-# GTFS to Kafka
+# Weather to Kafka
 
 Create an env file with the following parameters:
 - KAFKA_BOOTSTRAP
@@ -7,8 +7,8 @@ Create an env file with the following parameters:
 
 Use that env file in the following:
 ```
-docker build -t gtfs2kafka:0.0 .
-docker run --env-file path/to/1.env gtfs2kafka:0.0
+docker build -t weather2kafka:0.0 .
+docker run --env-file path/to/1.env weather2kafka:0.0
 ```
 
 
