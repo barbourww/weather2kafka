@@ -8,5 +8,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 
-RUN mkdir -p /var/log/gtfs2kafka
-CMD ["python3", "gtfs2kafka.py"]
+RUN mkdir -p /var/log/weather2kafka
+CMD ["python3", "weather2kafka.py"]
